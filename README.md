@@ -2,11 +2,11 @@
 
 個人用のウェブアプリ置き場。ビルドステップなしの静的サイト（素のHTML/CSS/JavaScript）で、GitHub Pagesで公開している。
 
-公開URL: https://apps.ryutaroyano.jp/
+公開URL: https://apps.ryutaroyano.jp/skills/gamification.html
 
 ## アプリ
 
-- [`gamification.html`](gamification.html): ゲーミフィケーション自己報酬アプリ。やったことで点数をためて、サイコロで報酬を引く。データはGoogle Apps Scriptの先のGoogleドライブ／スプレッドシートに保存し、合言葉で守っている。
+- [`skills/gamification.html`](skills/gamification.html): ゲーミフィケーション自己報酬アプリ。やったことで点数をためて、サイコロで報酬を引く。データはGoogle Apps Scriptの先のGoogleドライブ／スプレッドシートに保存し、合言葉で守っている。
 
 ## 設計上の約束
 
