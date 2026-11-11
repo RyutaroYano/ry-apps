@@ -681,7 +681,7 @@ function migrateActionSchema_(a){
 }
 
 function applyLoadedState(s){
-  state.points = s.points||0;
+  state.points = Math.max(0, Number(s.points) || 0);  // 点数を引く機能は無く、サイコロも3点以上でしか振れないので、0未満にはしない
   state.actions = (s.actions && s.actions.length) ? s.actions : cloneDefault(DEFAULT_ACTIONS);
   state.actions.forEach(migrateActionSchema_);
   state.rewards = (s.rewards && s.rewards.length) ? s.rewards : cloneDefault(DEFAULT_REWARDS);
@@ -745,6 +745,34 @@ function backupBeforeConflict_(staleState){
 // 保存のたびに使い捨てのトークンを発行し、直後の確認GETで「今サーバーに乗っている内容は
 // 本当に自分が今回書き込んだものか」を区別できるようにする（rev番号だけだと、複数端末が
 // 同じrevを取り合った際にどちらの書き込みが実際に反映されたのか見分けがつかないため）。
+// 記録（ログ）1件ごとに目印(id)を付ける。同じ内容の記録（同じ日に同じ報酬を2回使った等）を
+// 別の記録として数えられるうえ、「自分の書き込みが、確認できなかっただけでサーバーに届いていた」
+// ことを見分けるのに使う。
+function withLogId_(e){ e.id = Date.now().toString(36) + Math.random().toString(36).slice(2,6); return e; }
+
+// 最後に送った内容の控え。送った書き込みの確認が取れなかった（電波が弱い・アプリが閉じられた等）
+// 場合でも、実はサーバーに届いていることがある。その後に別の端末が書き込むと、この端末が次に
+// 合流するとき、届いていた分を「まだ送っていない増減」として足し直してしまう（点数の二重加算）。
+// 控えを残しておき、合流のときに「控えの内容がサーバーに既にある」と分かれば、それを基準にする。
+var LASTSENT_KEY = "gamification_lastsent_v1";
+function saveLastSent_(token, s){
+  try { localStorage.setItem(LASTSENT_KEY, JSON.stringify({ token:token, state:s })); } catch(e){}
+}
+function loadLastSent_(){
+  try { var r = localStorage.getItem(LASTSENT_KEY); return r ? JSON.parse(r) : null; } catch(e){ return null; }
+}
+function clearLastSent_(){
+  try { localStorage.removeItem(LASTSENT_KEY); } catch(e){}
+}
+// sent（送った内容）が、base（最後に一致を確認できた内容）より増やした記録が、すべてserverに既にあるか。
+function serverHasSentEntries_(sent, base, server){
+  var baseIds = {}, serverIds = {};
+  (base.log || []).forEach(function(e){ if (e && e.id) baseIds[e.id] = true; });
+  (server.log || []).forEach(function(e){ if (e && e.id) serverIds[e.id] = true; });
+  var added = (sent.log || []).filter(function(e){ return e && e.id && !baseIds[e.id]; });
+  return added.length > 0 && added.every(function(e){ return serverIds[e.id]; });
+}
+
 function newWriteToken_(){
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8);
 }
@@ -787,7 +815,7 @@ var freshSynced = false;
 function mergeStates_(base, local, server){
   var m = JSON.parse(JSON.stringify(server));
   function num(v){ return Number(v) || 0; }
-  m.points = num(server.points) + num(local.points) - num(base.points);  // ルール違反でマイナスになり得るので0で切らない
+  m.points = Math.max(0, num(server.points) + num(local.points) - num(base.points));  // 点数を引く機能は無いので、0未満にはしない
   ["earnedTotal","miyazaki"].forEach(function(k){
     m[k] = Math.max(0, num(server[k]) + num(local[k]) - num(base[k]));
   });
@@ -901,10 +929,13 @@ function resolveConflict_(s){
   // 合流する（＝この端末の値をそのまま増分として足す）。この端末の設定変更が
   // 二重に加算される可能性はあるが、入力そのものが消えるよりずっとまし。
   var base = loadBase_() || {};
+  var ls = loadLastSent_();
+  if (ls && ls.state && serverHasSentEntries_(ls.state, base, s)) base = ls.state;  // 届いていた分は足し直さない
   applyLoadedState(mergeStates_(base, state, s));
   state.rev = s.rev || 0;
   saveLocal();
   saveBase_(s);
+  clearLastSent_();
   setKnownWriter_(s.lastWriter);
   freshSynced = true;
   setSync("他の端末の更新と合流しました", "conflict");
@@ -948,6 +979,7 @@ function pushBody_(knownWriterOnServer){
   saveMyTokens_();  // 送信する前に残す（送信後すぐ閉じられても分かるように）
   var payload = JSON.stringify(state);
   var sentState = JSON.parse(payload);
+  saveLastSent_(token, sentState);  // 送る前に残す（送信後すぐ閉じられても分かるように）
   setSync("保存中…", "busy");
   return fetch(gasUrl(), {
     method: "POST",
@@ -970,6 +1002,7 @@ function handlePushResult_(res){
     state.rev = res.s.rev || state.rev;
     res.sentState.rev = state.rev;
     saveBase_(res.sentState);
+    clearLastSent_();
     setKnownWriter_(res.token);
     freshSynced = true;
     saveLocal();
@@ -1022,6 +1055,7 @@ function load(timeoutMs){
         applyLoadedState(s);
         saveLocal();
         saveBase_(s);
+        clearLastSent_();
         setKnownWriter_(s.lastWriter);
         freshSynced = true;
         setUnsynced_(false);
@@ -1194,7 +1228,7 @@ function addPoint(a, btn){
   if (a.dailyLimit && count >= a.dailyLimit) return;
   state.daily[td][a.id] = count + 1;
   state.points += a.pt;
-  state.log.unshift({ date:todayStr(), type:"earn", detail:a.label, pt:a.pt });
+  state.log.unshift(withLogId_({ date:todayStr(), type:"earn", detail:a.label, pt:a.pt }));
   // 累積獲得点を進め、特別報酬の解放点数をまたぐごとに1つ解放する
   var before = state.earnedTotal || 0;
   var after = before + a.pt;
@@ -1202,13 +1236,13 @@ function addPoint(a, btn){
   var unlocked = specialUnlockCount_(before, after);
   if (unlocked > 0){
     state.miyazaki = (state.miyazaki||0) + unlocked;
-    state.log.unshift({ date:todayStr(), type:"milestone", detail:state.special.emoji+" "+state.special.name+" 解放（累積"+after+"点）", pt:0 });
+    state.log.unshift(withLogId_({ date:todayStr(), type:"milestone", detail:state.special.emoji+" "+state.special.name+" 解放（累積"+after+"点）", pt:0 }));
   }
   // 70点をまたぐごとに㊗️当たりを1回、確実に解放
   var unlockedAtari = Math.floor(after/70) - Math.floor(before/70);
   if (unlockedAtari > 0){
     state.stock.atari = (state.stock.atari||0) + unlockedAtari;
-    state.log.unshift({ date:todayStr(), type:"milestone", detail:"㊗️ 当たり 確定解放（累積"+after+"点）", pt:0 });
+    state.log.unshift(withLogId_({ date:todayStr(), type:"milestone", detail:"㊗️ 当たり 確定解放（累積"+after+"点）", pt:0 }));
   }
   state.log = state.log.slice(0,200);
   save(); render();
@@ -1244,7 +1278,7 @@ function roll(){
       var rk = rollToReward(A,B);
       state.points -= COST;
       state.stock[rk] = (state.stock[rk]||0) + 1;
-      state.log.unshift({ date:todayStr(), type:"roll", detail:A+""+B+" → "+rewardsIndex[rk].emoji+rewardsIndex[rk].name, pt:-COST });
+      state.log.unshift(withLogId_({ date:todayStr(), type:"roll", detail:A+""+B+" → "+rewardsIndex[rk].emoji+rewardsIndex[rk].name, pt:-COST }));
       state.log = state.log.slice(0,200);
       rolling = false;
       save(); render();
@@ -1262,7 +1296,7 @@ function roll(){
 function consume(rk){
   if ((state.stock[rk]||0) <= 0) return;
   state.stock[rk] = (state.stock[rk]||0) - 1;
-  state.log.unshift({ date:todayStr(), type:"use", detail:rewardsIndex[rk].emoji+rewardsIndex[rk].name+" を消費", pt:0 });
+  state.log.unshift(withLogId_({ date:todayStr(), type:"use", detail:rewardsIndex[rk].emoji+rewardsIndex[rk].name+" を消費", pt:0 }));
   state.log = state.log.slice(0,200);
   save(); render();
   showFlash(rewardsIndex[rk].emoji+" 消費");
@@ -1295,7 +1329,7 @@ function pickAtariReward(rk){
   if ((state.stock.atari||0) <= 0){ closeAtariModal(); return; }
   state.stock.atari -= 1;
   state.stock[rk] = (state.stock[rk]||0) + 1;
-  state.log.unshift({ date:todayStr(), type:"use", detail:"㊗️ 当たり を "+rewardsIndex[rk].emoji+rewardsIndex[rk].name+" と交換", pt:0 });
+  state.log.unshift(withLogId_({ date:todayStr(), type:"use", detail:"㊗️ 当たり を "+rewardsIndex[rk].emoji+rewardsIndex[rk].name+" と交換", pt:0 }));
   state.log = state.log.slice(0,200);
   save(); render();
   closeAtariModal();
@@ -1372,7 +1406,7 @@ function confirmViolation(){
   if (!violationPick) return;
   var r = rewardsIndex[violationPick];
   var pen = pickPenalty_();
-  state.log.unshift({ date:todayStr(), type:"penalty", detail:"⚠️ ルール違反："+r.emoji+r.name+(pen ? " → "+pen.text : ""), pt:0 });
+  state.log.unshift(withLogId_({ date:todayStr(), type:"penalty", detail:"⚠️ ルール違反："+r.emoji+r.name+(pen ? " → "+pen.text : ""), pt:0 }));
   state.log = state.log.slice(0,200);
   // 引いた結果はその場でstateに入れる（閉じ直しや別端末で引き直せないように）。演出は見た目だけ。
   if (pen) state.pendingPenalty = { id:pen.id, text:pen.text, heavy:pen.heavy, at:Date.now() };
@@ -1427,7 +1461,7 @@ function renderPenaltyGate(){
 function completePenalty(){
   var pp = state.pendingPenalty;
   if (!pp) return;
-  state.log.unshift({ date:todayStr(), type:"penaltyDone", detail:"✅ 罰ゲーム完了："+pp.text, pt:0 });
+  state.log.unshift(withLogId_({ date:todayStr(), type:"penaltyDone", detail:"✅ 罰ゲーム完了："+pp.text, pt:0 }));
   state.log = state.log.slice(0,200);
   state.pendingPenalty = null;
   save(); render();
@@ -1487,7 +1521,7 @@ function manualConfirm(){
   var rk = rollToReward(A, B);
   state.points -= COST;
   state.stock[rk] = (state.stock[rk]||0) + 1;
-  state.log.unshift({ date:todayStr(), type:"manual", detail:A+"-"+B+" → "+rewardsIndex[rk].emoji+rewardsIndex[rk].name, pt:-COST });
+  state.log.unshift(withLogId_({ date:todayStr(), type:"manual", detail:A+"-"+B+" → "+rewardsIndex[rk].emoji+rewardsIndex[rk].name, pt:-COST }));
   state.log = state.log.slice(0,200);
   save(); render();
   closeManual();
@@ -1512,7 +1546,7 @@ function closeManual(){
 function consumeMiyazaki(){
   if ((state.miyazaki||0) <= 0) return;
   state.miyazaki -= 1;
-  state.log.unshift({ date:todayStr(), type:"use", detail:state.special.emoji+" "+state.special.name+" を消費", pt:0 });
+  state.log.unshift(withLogId_({ date:todayStr(), type:"use", detail:state.special.emoji+" "+state.special.name+" を消費", pt:0 }));
   state.log = state.log.slice(0,200);
   save(); render();
   showFlash(state.special.emoji+" 消費");
@@ -1665,7 +1699,7 @@ function confirmYesterdayLog(){
     if (delta > 0){
       rec[a.id] = draftVal;
       totalAdded += delta * a.pt;
-      state.log.unshift({ date:yd, type:"earn", detail:a.label+"（前日分"+(delta>1 ? " ×"+delta : "")+"）", pt:a.pt*delta });
+      state.log.unshift(withLogId_({ date:yd, type:"earn", detail:a.label+"（前日分"+(delta>1 ? " ×"+delta : "")+"）", pt:a.pt*delta }));
     }
   });
 
@@ -1679,12 +1713,12 @@ function confirmYesterdayLog(){
   var unlocked = specialUnlockCount_(before, after);
   if (unlocked > 0){
     state.miyazaki = (state.miyazaki||0) + unlocked;
-    state.log.unshift({ date:todayStr(), type:"milestone", detail:state.special.emoji+" "+state.special.name+" 解放（累積"+after+"点）", pt:0 });
+    state.log.unshift(withLogId_({ date:todayStr(), type:"milestone", detail:state.special.emoji+" "+state.special.name+" 解放（累積"+after+"点）", pt:0 }));
   }
   var unlockedAtari = Math.floor(after/70) - Math.floor(before/70);
   if (unlockedAtari > 0){
     state.stock.atari = (state.stock.atari||0) + unlockedAtari;
-    state.log.unshift({ date:todayStr(), type:"milestone", detail:"㊗️ 当たり 確定解放（累積"+after+"点）", pt:0 });
+    state.log.unshift(withLogId_({ date:todayStr(), type:"milestone", detail:"㊗️ 当たり 確定解放（累積"+after+"点）", pt:0 }));
   }
   state.log = state.log.slice(0,200);
 
